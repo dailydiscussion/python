@@ -1,20 +1,32 @@
-FROM python:3.12-slim
+# Multi-stage production build for Hugging Face Spaces / Render / Railway / Cloud
+FROM rust:1.80-alpine AS builder
 
-RUN useradd -m -u 1000 user
+RUN apk add --no-cache musl-dev pkgconfig
+
+WORKDIR /app
+COPY Cargo.toml ./
+
+# Cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+
+# Copy real sources and compile optimized binary
+COPY src ./src
+RUN touch src/main.rs && cargo build --release
+
+# Minimal runtime stage (~18MB)
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata && \
+    adduser -D -u 1000 user
+
 USER user
 ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
+    PORT=7860 \
+    PROXY_URL=http://lpmrbkqk:cpege5k4lr07@45.38.107.97:6014
 
 WORKDIR $HOME/app
-
-COPY --chown=user requirements.txt .
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
-
-COPY --chown=user . .
-
-ENV PORT=7860
-ENV PROXY_URL=http://lpmrbkqk:cpege5k4lr07@45.38.107.97:6014
+COPY --from=builder /app/target/release/moviebox-api-rs $HOME/app/moviebox-api
 
 EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn moviebox_api_server:app --host 0.0.0.0 --port ${PORT:-7860}"]
+CMD ["/home/user/app/moviebox-api"]

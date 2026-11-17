@@ -42,3 +42,6 @@ mingit/
 *.exe
 *.log
 .DS_Store
+
+# Rust
+target/
