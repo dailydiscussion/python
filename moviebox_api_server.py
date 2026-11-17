@@ -102,16 +102,19 @@ def get_session(session_id: Optional[str] = None):
     }
     logger.info(f"Created new session: {sid}")
     
-    # Bootstrap fresh guest credentials via official visitor-login
-    try:
-        logger.info(f"Bootstrapping guest credentials for session {sid} via visitor-login...")
-        login_res = client.visitor_login()
-        if login_res.get("status") == "success":
-            logger.info(f"Bootstrap guest token success: {auth.token[:30]}... UID: {auth.user_id}")
-        else:
-            logger.warning(f"visitor-login returned error: {login_res}")
-    except Exception as e:
-        logger.error(f"Failed to bootstrap guest session: {e}")
+    # Bootstrap credentials only if no permanent ACCOUNT_TOKEN is configured in environment
+    if not os.environ.get("ACCOUNT_TOKEN"):
+        try:
+            logger.info(f"Bootstrapping guest credentials for session {sid} via visitor-login...")
+            login_res = client.visitor_login()
+            if login_res.get("status") == "success":
+                logger.info(f"Bootstrap guest token success: {auth.token[:30]}... UID: {auth.user_id}")
+            else:
+                logger.warning(f"visitor-login returned error: {login_res}")
+        except Exception as e:
+            logger.error(f"Failed to bootstrap guest session: {e}")
+    else:
+        logger.info(f"Session {sid} active with permanent ACCOUNT_TOKEN for UID: {auth.user_id}")
         
     return sessions[sid]
 

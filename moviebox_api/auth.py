@@ -6,10 +6,12 @@ DEFAULT_GUEST_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0
 
 class MovieBoxAuth:
     def __init__(self, token: str = None, user_id: str = None):
-        self.token = token or DEFAULT_GUEST_TOKEN
-        self.user_id = user_id or "7065948410213816232"
+        env_token = os.environ.get("ACCOUNT_TOKEN")
+        env_uid = os.environ.get("ACCOUNT_USER_ID")
+        self.token = token or env_token or DEFAULT_GUEST_TOKEN
+        self.user_id = user_id or env_uid or "7065948410213816232"
         self.is_logged_in = True
-        self.is_guest_mode = True
+        self.is_guest_mode = False if env_token else True
         self.client_info = get_default_client_info()
         self.user_info = None
         # REMOVED: self.load_session() - We no longer use a global file for multiple sessions

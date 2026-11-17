@@ -32,13 +32,28 @@ impl AppState {
                 .unwrap_or_default(),
         );
 
-        // Bootstrap guest session
-        let (token, uid) = client.visitor_login().await.unwrap_or_else(|_| {
-            (
-                crate::utils::DEFAULT_GUEST_TOKEN.to_string(),
-                "7065948410213816232".to_string(),
-            )
-        });
+        // Check for configured permanent account token in environment
+        let (token, uid) = if let Ok(env_token) = std::env::var("ACCOUNT_TOKEN") {
+            if !env_token.trim().is_empty() {
+                let env_uid = std::env::var("ACCOUNT_USER_ID").unwrap_or_else(|_| "7065948410213816232".to_string());
+                tracing::info!("Initialized backend with permanent ACCOUNT_TOKEN for UID: {}", env_uid);
+                (env_token.trim().to_string(), env_uid.trim().to_string())
+            } else {
+                client.visitor_login().await.unwrap_or_else(|_| {
+                    (
+                        crate::utils::DEFAULT_GUEST_TOKEN.to_string(),
+                        "7065948410213816232".to_string(),
+                    )
+                })
+            }
+        } else {
+            client.visitor_login().await.unwrap_or_else(|_| {
+                (
+                    crate::utils::DEFAULT_GUEST_TOKEN.to_string(),
+                    "7065948410213816232".to_string(),
+                )
+            })
+        };
 
         Self {
             client,
