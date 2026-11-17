@@ -451,15 +451,33 @@ pub async fn login_handler(
     if res.get("status").and_then(|v| v.as_str()) == Some("success") {
         if let Some(user) = res.get("user") {
             let token = user.get("token").and_then(|v| v.as_str()).unwrap_or(&sess.token).to_string();
+            let uid = user.get("userId").or_else(|| user.get("uid")).and_then(|v| {
+                if let Some(s) = v.as_str() { Some(s.to_string()) }
+                else if let Some(n) = v.as_i64() { Some(n.to_string()) }
+                else { None }
+            }).unwrap_or_else(|| sess.user_id.clone());
+
+            // Permanently save account to disk
+            crate::state::save_account_to_disk(&token, &uid, Some(user));
+
             let mut write_guard = state.sessions.write().await;
             if let Some(s) = write_guard.get_mut(&sess.id) {
-                s.token = token;
+                s.token = token.clone();
+                s.user_id = uid.clone();
                 s.user_info = Some(user.clone());
             }
+
+            // Also update global guest token so every subsequent session uses this account
+            let mut global_guard = state.guest_token.write().await;
+            *global_guard = (token, uid);
         }
     }
 
-    Json(res).into_response()
+    let mut resp = Json(res).into_response();
+    if let Ok(cval) = format!("session_id={}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=31536000", sess.id).parse() {
+        resp.headers_mut().insert(header::SET_COOKIE, cval);
+    }
+    resp
 }
 
 pub async fn logout_handler(

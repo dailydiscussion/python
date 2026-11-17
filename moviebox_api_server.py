@@ -80,6 +80,28 @@ def save_local_history(h: dict):
     except Exception as e:
         logger.error(f"Failed to save local history: {e}")
 
+SAVED_ACCOUNT_FILE = "saved_account.json"
+
+def save_permanent_account(token: str, user_id: str, user_info: dict = None):
+    try:
+        data = {"token": token, "user_id": str(user_id), "user_info": user_info}
+        with open(SAVED_ACCOUNT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"PERMANENTLY SAVED ACCOUNT to {SAVED_ACCOUNT_FILE} for UID: {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to save permanent account: {e}")
+
+def load_permanent_account() -> Optional[dict]:
+    if os.path.exists(SAVED_ACCOUNT_FILE):
+        try:
+            with open(SAVED_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("token"):
+                    return data
+        except Exception as e:
+            logger.error(f"Failed to load permanent account: {e}")
+    return None
+
 def get_session(session_id: Optional[str] = None):
     # Check if session exists
     if session_id and session_id in sessions:
@@ -92,18 +114,20 @@ def get_session(session_id: Optional[str] = None):
     proxy_url = os.environ.get("PROXY_URL", "http://lpmrbkqk:cpege5k4lr07@45.38.107.97:6014")
     if proxy_url:
         client.session.proxies = {"http": proxy_url, "https": proxy_url}
-    sessions[sid] = {
-        "id": sid,
-        "auth": auth,
-        "client": client,
-        "content": MovieBoxContent(client),
-        "stream": MovieBoxStream(client),
-        "user": MovieBoxUser(client)
-    }
-    logger.info(f"Created new session: {sid}")
     
-    # Bootstrap credentials only if no permanent ACCOUNT_TOKEN is configured in environment
-    if not os.environ.get("ACCOUNT_TOKEN"):
+    # 1. Check permanent account on disk or in environment
+    perm = load_permanent_account()
+    env_token = os.environ.get("ACCOUNT_TOKEN")
+    env_uid = os.environ.get("ACCOUNT_USER_ID")
+    
+    active_token = (perm.get("token") if perm else None) or env_token
+    active_uid = (perm.get("user_id") if perm else None) or env_uid
+    
+    if active_token:
+        auth.update_session(active_token, user_id=active_uid, user_info=perm.get("user_info") if perm else None)
+        auth.is_guest_mode = False
+        logger.info(f"Session {sid} active with PERMANENT account for UID: {active_uid}")
+    else:
         try:
             logger.info(f"Bootstrapping guest credentials for session {sid} via visitor-login...")
             login_res = client.visitor_login()
@@ -113,9 +137,15 @@ def get_session(session_id: Optional[str] = None):
                 logger.warning(f"visitor-login returned error: {login_res}")
         except Exception as e:
             logger.error(f"Failed to bootstrap guest session: {e}")
-    else:
-        logger.info(f"Session {sid} active with permanent ACCOUNT_TOKEN for UID: {auth.user_id}")
-        
+
+    sessions[sid] = {
+        "id": sid,
+        "auth": auth,
+        "client": client,
+        "content": MovieBoxContent(client),
+        "stream": MovieBoxStream(client),
+        "user": MovieBoxUser(client)
+    }
     return sessions[sid]
 
 class LoginRequest(BaseModel):
@@ -149,13 +179,23 @@ def login(req: LoginRequest, response: Response, session_id: Optional[str] = Coo
     if res["status"] == "error":
         raise HTTPException(status_code=400, detail=res["message"])
     
-    # Always set/refresh the session cookie on login
+    # Permanently store account credentials on disk so reboots/future sessions keep them
+    if res.get("status") == "success" and "user" in res:
+        u_data = res["user"]
+        u_tok = u_data.get("token")
+        u_id = u_data.get("userId") or u_data.get("uid")
+        if u_tok:
+            save_permanent_account(u_tok, u_id, u_data)
+            logger.info(f"PERMANENT ACCOUNT ACTIVATED on login for UID: {u_id}")
+
+    # Set cross-site compatible session cookie (SameSite=None, Secure=True for web.app <-> workers.dev)
     response.set_cookie(
         key="session_id", 
         value=s["id"], 
         httponly=True, 
-        samesite="lax",
-        max_age=3600 * 24 * 30 # 30 days
+        samesite="none",
+        secure=True,
+        max_age=3600 * 24 * 365 # 1 year permanent
     )
     return res
 

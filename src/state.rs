@@ -21,6 +21,27 @@ pub struct AppState {
     pub guest_token: Arc<RwLock<(String, String)>>,
 }
 
+pub fn load_saved_account() -> Option<(String, String)> {
+    if let Ok(content) = std::fs::read_to_string("saved_account.json") {
+        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+            if let Some(tok) = val.get("token").and_then(|v| v.as_str()) {
+                let uid = val.get("user_id").and_then(|v| v.as_str()).unwrap_or("7065948410213816232");
+                return Some((tok.to_string(), uid.to_string()));
+            }
+        }
+    }
+    None
+}
+
+pub fn save_account_to_disk(token: &str, user_id: &str, user_info: Option<&Value>) {
+    let data = serde_json::json!({
+        "token": token,
+        "user_id": user_id,
+        "user_info": user_info
+    });
+    let _ = std::fs::write("saved_account.json", serde_json::to_string_pretty(&data).unwrap_or_default());
+}
+
 impl AppState {
     pub async fn new() -> Self {
         let client = MovieBoxClient::new();
@@ -32,8 +53,11 @@ impl AppState {
                 .unwrap_or_default(),
         );
 
-        // Check for configured permanent account token in environment
-        let (token, uid) = if let Ok(env_token) = std::env::var("ACCOUNT_TOKEN") {
+        // Check for permanent saved account on disk or environment variable
+        let (token, uid) = if let Some((saved_tok, saved_uid)) = load_saved_account() {
+            tracing::info!("Initialized backend with PERMANENT saved_account.json for UID: {}", saved_uid);
+            (saved_tok, saved_uid)
+        } else if let Ok(env_token) = std::env::var("ACCOUNT_TOKEN") {
             if !env_token.trim().is_empty() {
                 let env_uid = std::env::var("ACCOUNT_USER_ID").unwrap_or_else(|_| "7065948410213816232".to_string());
                 tracing::info!("Initialized backend with permanent ACCOUNT_TOKEN for UID: {}", env_uid);
