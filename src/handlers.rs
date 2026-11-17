@@ -339,6 +339,19 @@ pub async fn rankings_handler(
     }))
 }
 
+fn is_deprecation_notice_url(u: &str) -> bool {
+    if u.is_empty() {
+        return false;
+    }
+    let lower = u.to_lowercase();
+    lower.contains("notice.mp4")
+        || (lower.contains("macdn.aoneroom.com") && lower.contains("/other/"))
+        || lower.contains("1c7de0bd3393702d9191801f15f88f8d")
+        || lower.contains("9a0461bc39da389663bf3dbb17091d3f")
+        || lower.contains("80da52722ee7de7a4303290af6783424")
+        || lower.contains("b164fbfb4347792950bdfbfb563d39d9")
+}
+
 pub async fn stream_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -367,8 +380,25 @@ pub async fn stream_handler(
         })));
     }
 
+    // Filter out anti-piracy / deprecation dummy notice clips
+    let valid_streams: Vec<Value> = streams
+        .into_iter()
+        .filter(|st| {
+            let u = st.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            !is_deprecation_notice_url(u)
+        })
+        .collect();
+
+    if valid_streams.is_empty() {
+        return Ok(Json(json!({
+            "code": 404,
+            "msg": "No playable stream available. The upstream provider only hosts a placeholder notice clip for this title.",
+            "data": {}
+        })));
+    }
+
     // Pick first working or best stream
-    let best_stream = streams[0].clone();
+    let best_stream = valid_streams[0].clone();
     let raw_url = best_stream.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let cookie = best_stream
         .get("signCookie")
@@ -407,14 +437,36 @@ pub async fn stream_handler(
     let is_hls = raw_url.to_lowercase().contains(".m3u8");
     let is_dash = raw_url.to_lowercase().contains(".mpd");
 
+    let stream_dur = best_stream.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+    let duration = if stream_dur > 60 { stream_dur } else { 7200 };
+
+    let quality_list = if let Some(res_str) = best_stream.get("resolutions").and_then(|v| v.as_str()) {
+        res_str.split(',').map(|r| format!("{}p", r.trim())).collect::<Vec<String>>()
+    } else {
+        vec!["720p".to_string(), "480p".to_string()]
+    };
+
+    let stream_id = best_stream.get("id").and_then(|v| {
+        if let Some(s) = v.as_str() { Some(s.to_string()) }
+        else if let Some(n) = v.as_i64() { Some(n.to_string()) }
+        else { None }
+    }).unwrap_or_default();
+
+    let subtitle_url = subtitles.first().and_then(|s| s.get("url")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
     Ok(Json(json!({
         "url": proxied_url,
         "raw_url": raw_url,
         "cookie": cookie,
-        "duration": 3600,
+        "duration": duration,
         "subtitles": subtitles,
+        "subtitle_url": subtitle_url,
         "isHls": is_hls,
         "isDash": is_dash,
+        "streamId": stream_id,
+        "qualityList": quality_list,
+        "episode": episode,
+        "season": season,
         "headers": {
             "User-Agent": "ExoPlayerLib/2.19.1",
             "Cookie": cookie
@@ -437,6 +489,8 @@ pub async fn user_info_handler(
             json!({
                 "userId": uid,
                 "nickname": format!("VIP User ({})", suffix),
+                "mail": format!("vip_{}@moviebox.pro", suffix),
+                "phone": format!("VIP-{}", suffix),
                 "avatar": ""
             })
         });
