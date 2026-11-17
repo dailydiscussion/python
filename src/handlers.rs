@@ -427,15 +427,31 @@ pub async fn user_info_handler(
     headers: HeaderMap,
 ) -> Json<Value> {
     let sess = state.get_session(get_session_id(&headers).as_deref()).await;
-    if let Some(u) = sess.user_info {
+    let perm = crate::state::load_saved_account();
+    let is_logged_in = sess.user_info.is_some() || perm.is_some() || std::env::var("ACCOUNT_TOKEN").is_ok();
+
+    if is_logged_in {
+        let u = sess.user_info.unwrap_or_else(|| {
+            let uid = perm.map(|p| p.1).unwrap_or(sess.user_id);
+            let suffix = if uid.len() >= 4 { &uid[uid.len()-4..] } else { &uid };
+            json!({
+                "userId": uid,
+                "nickname": format!("VIP User ({})", suffix),
+                "avatar": ""
+            })
+        });
         Json(json!({
             "logged_in": true,
-            "user": u
+            "mode": "Official Account",
+            "user": u,
+            "session_id": sess.id
         }))
     } else {
         Json(json!({
             "logged_in": false,
-            "user": null
+            "mode": "Guest Access",
+            "user": null,
+            "session_id": sess.id
         }))
     }
 }

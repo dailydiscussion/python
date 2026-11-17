@@ -221,15 +221,21 @@ def get_user_info(response: Response, session_id: Optional[str] = Cookie(None)):
     
     # If no session_id was provided, set the newly created one
     if not session_id:
-        response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="lax")
+        response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="none", secure=True, max_age=3600*24*365)
 
-    if not s["auth"].is_logged_in:
-        return {"logged_in": False, "mode": "Guest Access", "session_id": s["id"]}
+    if not s["auth"].is_logged_in or s["auth"].is_guest_mode:
+        return {"logged_in": False, "mode": "Guest Access", "session_id": s["id"], "user": None}
         
+    u_info = s["auth"].user_info or {
+        "userId": s["auth"].user_id,
+        "nickname": f"VIP User ({str(s['auth'].user_id)[-4:]})",
+        "avatar": ""
+    }
+
     return {
         "logged_in": True,
         "mode": "Official Account", 
-        "user": s["auth"].user_info,
+        "user": u_info,
         "session_id": s["id"]
     }
 
