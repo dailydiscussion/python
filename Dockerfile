@@ -1,32 +1,20 @@
-# Multi-stage production build for Hugging Face Spaces / Render / Railway / Cloud
-FROM rust:1.80-alpine AS builder
-
-RUN apk add --no-cache musl-dev pkgconfig
+# Python Production Container for MovieBox API on Render / Cloud
+FROM python:3.11-slim
 
 WORKDIR /app
-COPY Cargo.toml ./
 
-# Cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
+# Install dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy real sources and compile optimized binary
-COPY src ./src
-RUN touch src/main.rs && cargo build --release
+# Copy backend application and permanent account configuration
+COPY moviebox_api/ ./moviebox_api/
+COPY moviebox_api_server.py ./
+COPY saved_account.json ./
 
-# Minimal runtime stage (~18MB)
-FROM alpine:3.20
+ENV PORT=8000 \
+    PYTHONUNBUFFERED=1
 
-RUN apk add --no-cache ca-certificates tzdata && \
-    adduser -D -u 1000 user
+EXPOSE 8000
 
-USER user
-ENV HOME=/home/user \
-    PORT=7860 \
-    PROXY_URL=http://lpmrbkqk:cpege5k4lr07@45.38.107.97:6014
-
-WORKDIR $HOME/app
-COPY --from=builder /app/target/release/moviebox-api-rs $HOME/app/moviebox-api
-
-EXPOSE 7860
-
-CMD ["/home/user/app/moviebox-api"]
+CMD ["sh", "-c", "uvicorn moviebox_api_server:app --host 0.0.0.0 --port ${PORT:-8000}"]
