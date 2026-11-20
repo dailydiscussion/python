@@ -15,7 +15,9 @@ import asyncio
 import logging
 import uuid
 import re
-from urllib.parse import quote
+import ipaddress
+import socket
+from urllib.parse import quote, urlparse
 from moviebox_api import MovieBoxClient, MovieBoxAuth, MovieBoxContent, MovieBoxStream, MovieBoxUser
 
 # Configure logging
@@ -51,10 +53,11 @@ _allowed_origins += [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(set(_allowed_origins)),
-    allow_origin_regex=r"https://.*\.web\.app|https://.*\.firebaseapp\.com",
+    allow_origin_regex=r"^https://moviebox-stream\.(web\.app|firebaseapp\.com)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
 
 
@@ -80,7 +83,7 @@ def save_local_history(h: dict):
     except Exception as e:
         logger.error(f"Failed to save local history: {e}")
 
-SAVED_ACCOUNT_FILE = "saved_account.json"
+SAVED_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_account.json")
 
 def save_permanent_account(token: str, user_id: str, user_info: dict = None):
     try:
@@ -102,6 +105,105 @@ def load_permanent_account() -> Optional[dict]:
             logger.error(f"Failed to load permanent account: {e}")
     return None
 
+def is_deprecation_notice_url(u: str) -> bool:
+    """Detect fake/dummy upgrade notice clips (anti-piracy trap videos)."""
+    if not u:
+        return False
+    lower = u.lower()
+    return (
+        "notice.mp4" in lower
+        or ("macdn.aoneroom.com" in lower and "/other/" in lower)
+        or "1c7de0bd3393702d9191801f15f88f8d" in lower
+        or "9a0461bc39da389663bf3dbb17091d3f" in lower
+        or "80da52722ee7de7a4303290af6783424" in lower
+        or "b164fbfb4347792950bdfbfb563d39d9" in lower
+    )
+
+def resolve_ugc_streams(client: MovieBoxClient, subject_id: str, season: int = 1, episode: int = 1, is_movie: bool = False) -> list:
+    """
+    Official MovieBox v4.4 UGC Video & Collection Pipeline.
+    MovieBox moved titles to User-Generated / Shared Collections with signed CDN URLs.
+    When legacy play-info returns dummy placeholder clips, this pipeline extracts genuine
+    signed CDN streams (e.g. bcdn.hakunaymatata.com) for both Movies and Series episodes.
+    """
+    ugc_streams = []
+    try:
+        f_res = client.request('GET', '/wefeed-mobile-bff/ugc/video/first-by-subject', params={'subjectId': str(subject_id)})
+        f_data = (f_res.get('data') or {}) if isinstance(f_res, dict) else {}
+        first_ugc_id = f_data.get('ugcVideoId')
+        coll_info = f_data.get('belongToCollection') or {}
+        coll_id = coll_info.get('collectionId')
+        
+        # 1. If subject is in a collection (TV series or multi-part franchise)
+        if coll_id:
+            c_res = client.request('GET', '/wefeed-mobile-bff/ugc/collection/download-list', params={'collectionId': str(coll_id), 'page': '1', 'perPage': 50})
+            c_items = ((c_res.get('data') or {}).get('items') or []) if isinstance(c_res, dict) else []
+            
+            target_item = None
+            if is_movie and c_items:
+                target_item = c_items[0]
+            else:
+                pattern = re.compile(rf'(?i)(?:s0*{season}\s*)?(?:ep|episode|e|#|\s|^)0*{episode}(?:[^\d]|$)', re.IGNORECASE)
+                for idx, item in enumerate(c_items):
+                    ep_val = item.get('episode')
+                    ep_title = item.get('epTitle') or item.get('title') or ''
+                    if ep_val is not None:
+                        try:
+                            if int(ep_val) == int(episode):
+                                target_item = item
+                                break
+                        except: pass
+                    if pattern.search(ep_title):
+                        target_item = item
+                        break
+                
+                # Positional fallback (1-based index)
+                if not target_item and 0 <= episode - 1 < len(c_items):
+                    target_item = c_items[episode - 1]
+            
+            if target_item:
+                res_list = target_item.get('resources') or []
+                if not res_list and target_item.get('ugcVideoId'):
+                    v_res = client.request('GET', '/wefeed-mobile-bff/ugc/video/download', params={'ugcVideoId': str(target_item['ugcVideoId'])})
+                    v_items = ((v_res.get('data') or {}).get('items') or []) if isinstance(v_res, dict) else []
+                    if v_items:
+                        res_list = v_items[0].get('resources') or []
+                
+                for r in res_list:
+                    r_url = r.get('url')
+                    if r_url and not is_deprecation_notice_url(r_url):
+                        ugc_streams.append({
+                            'url': r_url,
+                            'quality': f"{r.get('resolutions')}p" if r.get('resolutions') else 'Auto',
+                            'signCookie': r.get('signCookie') or '',
+                            'codec': r.get('codecName') or '',
+                            'id': str(r.get('id') or target_item.get('ugcVideoId') or ''),
+                            'duration': r.get('duration') or 0,
+                            'size': r.get('size') or 0
+                        })
+
+        # 2. If no collection streams found, try direct standalone ugc video download
+        if not ugc_streams and first_ugc_id:
+            v_res = client.request('GET', '/wefeed-mobile-bff/ugc/video/download', params={'ugcVideoId': str(first_ugc_id)})
+            v_items = ((v_res.get('data') or {}).get('items') or []) if isinstance(v_res, dict) else []
+            for it in v_items:
+                for r in (it.get('resources') or []):
+                    r_url = r.get('url')
+                    if r_url and not is_deprecation_notice_url(r_url):
+                        ugc_streams.append({
+                            'url': r_url,
+                            'quality': f"{r.get('resolutions')}p" if r.get('resolutions') else 'Auto',
+                            'signCookie': r.get('signCookie') or '',
+                            'codec': r.get('codecName') or '',
+                            'id': str(r.get('id') or first_ugc_id),
+                            'duration': r.get('duration') or 0,
+                            'size': r.get('size') or 0
+                        })
+    except Exception as e:
+        logger.warning(f"resolve_ugc_streams error: {e}")
+        
+    return ugc_streams
+
 def get_session(session_id: Optional[str] = None):
     # Check if session exists
     if session_id and session_id in sessions:
@@ -111,7 +213,7 @@ def get_session(session_id: Optional[str] = None):
     sid = str(uuid.uuid4())
     auth = MovieBoxAuth()
     client = MovieBoxClient(auth=auth)
-    proxy_url = os.environ.get("PROXY_URL", "http://lpmrbkqk:cpege5k4lr07@45.38.107.97:6014")
+    proxy_url = os.environ.get("PROXY_URL", "")
     if proxy_url:
         client.session.proxies = {"http": proxy_url, "https": proxy_url}
     
@@ -182,19 +284,21 @@ def login(req: LoginRequest, response: Response, session_id: Optional[str] = Coo
     # Permanently store account credentials on disk so reboots/future sessions keep them
     if res.get("status") == "success" and "user" in res:
         u_data = res["user"]
+        if "@" in req.account and "mail" not in u_data:
+            u_data["mail"] = req.account
         u_tok = u_data.get("token")
         u_id = u_data.get("userId") or u_data.get("uid")
         if u_tok:
             save_permanent_account(u_tok, u_id, u_data)
             logger.info(f"PERMANENT ACCOUNT ACTIVATED on login for UID: {u_id}")
 
-    # Set cross-site compatible session cookie (SameSite=None, Secure=True for web.app <-> workers.dev)
+    # Set cross-site compatible session cookie (Lax for local development)
     response.set_cookie(
         key="session_id", 
         value=s["id"], 
         httponly=True, 
-        samesite="none",
-        secure=True,
+        samesite="lax",
+        secure=False,
         max_age=3600 * 24 * 365 # 1 year permanent
     )
     return res
@@ -221,7 +325,7 @@ def get_user_info(response: Response, session_id: Optional[str] = Cookie(None)):
     
     # If no session_id was provided, set the newly created one
     if not session_id:
-        response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="none", secure=True, max_age=3600*24*365)
+        response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="lax", secure=False, max_age=3600*24*365)
 
     if not s["auth"].is_logged_in or s["auth"].is_guest_mode:
         return {"logged_in": False, "mode": "Guest Access", "session_id": s["id"], "user": None}
@@ -1104,6 +1208,14 @@ def get_stream(request: Request, subject_id: str, season: int = 1, episode: int 
     # Always discard anti-piracy dummy clips; only retain verified streams
     streams = recovered_streams
 
+    # Primary Fallback: Official MovieBox v4.4 UGC stream pipeline
+    if not streams:
+        logger.info(f"No valid streams from primary resolvers for {subject_id}. Engaging MovieBox v4.4 UGC stream pipeline...")
+        ugc_streams = resolve_ugc_streams(s["client"], subject_id, season=season, episode=episode, is_movie=is_movie)
+        if ugc_streams:
+            logger.info(f"UGC SUCCESS: Recovered {len(ugc_streams)} signed CDN streams for {subject_id} S{season}E{episode}")
+            streams = ugc_streams
+
     # Fallback to resourceDetectors inside movie/show detail if no streams found
     if not streams:
         logger.info(f"No valid streams from primary resolvers. Checking resourceDetectors for subject {subject_id}...")
@@ -1256,8 +1368,10 @@ def get_stream(request: Request, subject_id: str, season: int = 1, episode: int 
                     p_streams = p_data.get('streamList') or p_data.get('streams') or []
 
                 logger.info(f"Probe {r_id} Result: {len(p_streams)} streams recovered")
-                if p_streams:
-                    working_stream = p_streams[0]
+                # Filter out deprecation/placeholder notice clips
+                valid_p_streams = [cand for cand in p_streams if not is_deprecation_notice_url(cand.get("url"))]
+                if valid_p_streams:
+                    working_stream = valid_p_streams[0]
                     
                     # PROACTIVE PING: Force a session handshake with the media CDN
                     if "hakunaymatata" in working_stream.get("url", ""):
@@ -1293,7 +1407,7 @@ def get_stream(request: Request, subject_id: str, season: int = 1, episode: int 
     is_hevc = any("h265" in st.get("url", "").lower() or "x265" in st.get("url", "").lower() or "hev1" in st.get("url", "").lower() or "h.265" in st.get("url", "").lower() for st in streams)
     
     # We also check for 'hev1' codec signatures in manifest URLs if found
-    h265_candidate = next((st for st in streams if any(bad in st.get("url", "").lower() for bad in ["h265", "x265", "hev1", "h.265"])), None)
+    h265_candidate = next((st for st in streams if any(bad in st.get("url", "").lower() for bad in ["h265", "x265", "hev1", "h.265"]) and not is_deprecation_notice_url(st.get("url"))), None)
     
     if is_hevc and h265_candidate:
         logger.info(f"Detected HEVC/H.265. Directly serving RAW stream for Native Player support...")
@@ -1352,7 +1466,7 @@ def get_stream(request: Request, subject_id: str, season: int = 1, episode: int 
                 
                 for cand in srcs:
                     url = cand.get('url')
-                    if not url: continue
+                    if not url or is_deprecation_notice_url(url): continue
                     cookie = cand.get('signCookie') or fb_res.get('signCookie') or fb_data.get('signCookie') or s["client"].session.cookies.get("signCookie") or global_cookie or ""
                     try:
                         v_res = requests.head(url, headers={"User-Agent": "ExoPlayerLib/2.18.7", "Cookie": cookie}, timeout=3, verify=False)
@@ -1370,12 +1484,17 @@ def get_stream(request: Request, subject_id: str, season: int = 1, episode: int 
                 s["client"].BASE_URL = orig_base
     
     if not working_stream and streams:
-        working_stream = streams[0]
-        working_cookie = working_stream.get("signCookie") or global_cookie or ""
+        valid_fallback = [st for st in streams if not is_deprecation_notice_url(st.get("url"))]
+        if valid_fallback:
+            working_stream = valid_fallback[0]
+            working_cookie = working_stream.get("signCookie") or global_cookie or ""
 
     if not working_stream:
-        logger.error(f"RESOLUTION FAILURE: No usable streams found for subject {subject_id}")
-        raise HTTPException(status_code=404, detail="No streams found.")
+        logger.error(f"RESOLUTION FAILURE: No usable non-notice streams found for subject {subject_id}")
+        raise HTTPException(
+            status_code=404,
+            detail="No playable stream available. Upstream MovieBox only hosts a placeholder notice clip for guest accounts on this title. Please sign in or try another title."
+        )
 
     # CALCULATE METADATA DURATION FOR FRONTEND OVERRIDE
     total_duration = 0
@@ -1646,15 +1765,21 @@ async def proxy_download(
         data = res.get("data", {})
         streams = data.get("streamList") or data.get("streams") or []
     
-    if not streams: 
-        raise HTTPException(status_code=404, detail="No downloadable mirrors found")
+    # Filter out deprecation/placeholder notice clips
+    valid_streams = [st for st in streams if not is_deprecation_notice_url(st.get("url"))]
+    if not valid_streams:
+        ugc_dl = resolve_ugc_streams(s["client"], subject_id, season=season, episode=episode, is_movie=(season == 1 and episode == 1))
+        if ugc_dl:
+            valid_streams = ugc_dl
+    if not valid_streams: 
+        raise HTTPException(status_code=404, detail="No downloadable mirrors found (placeholder notice clip rejected).")
     
     match = None
-    for st in streams:
+    for st in valid_streams:
         if ".mp4" in st.get("url", "").lower():
             match = st
             break
-    if not match: match = streams[0]
+    if not match: match = valid_streams[0]
             
     url = match.get("url")
     cookie = data.get("signCookie") or match.get("signCookie") or ""
@@ -1973,18 +2098,18 @@ def launch_player(player: str, url: str, cookie: Optional[str] = None, subject_i
         if subtitle_url: cmd.append(f'--sub-file={subtitle_url}')
         cmd.append(url)
     
-    # WINDOWS SHELL QUOTING FIX: Rebuild command string with proper quotes for the shell
-    def win_quote(s):
-        if ' ' in s or '&' in s or '?' in s or '=' in s:
-            return f'"{s}"'
-        return s
-    
-    cmd_str = ' '.join(map(win_quote, cmd))
-    logger.info(f"EXEC CMD (WIN): {cmd_str}")
-    
-    # On Windows, we use shell=True and CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(cmd_str, shell=True, creationflags=0x00000200)
-    return {"status": "success", "url": url}
+    # Secure execution without shell=True to eliminate command injection
+    try:
+        creation_flags = 0
+        if os.name == 'nt':
+            # CREATE_NO_WINDOW (0x08000000) or CREATE_NEW_PROCESS_GROUP (0x00000200)
+            creation_flags = 0x00000200
+        logger.info(f"EXEC CMD (SECURE): {cmd}")
+        subprocess.Popen(cmd, creationflags=creation_flags, close_fds=True if os.name != 'nt' else False)
+        return {"status": "success", "url": url}
+    except Exception as e:
+        logger.error(f"Failed to securely launch player: {e}")
+        raise HTTPException(status_code=500, detail=f"Player launch failed: {str(e)}")
 
 @app.get("/post/count/{subject_id}")
 def get_post_count(subject_id: str, session_id: Optional[str] = Cookie(None)):
@@ -2080,12 +2205,41 @@ def debug_history(session_id: Optional[str] = Cookie(None)):
 
 # DIRECT NATIVE PLAYBACK ONLY (PROXIES REMOVED)
 
+def is_safe_external_url(url: str) -> bool:
+    """Validates URL scheme and ensures it does not resolve to private/loopback/link-local networks."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Block known dangerous hostnames
+        if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "metadata.google.internal"):
+            return False
+        # Resolve hostname to IP to prevent DNS rebinding or RFC-1918 targeting
+        for addr_info in socket.getaddrinfo(hostname, None):
+            ip_str = addr_info[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"URL security check failed for {url}: {e}")
+        return False
+
 @app.get("/sub-proxy")
 async def subtitle_proxy(u: str):
-    """Proxies external subtitles to bypass CORS blocking."""
-    async with httpx.AsyncClient(verify=False) as client:
-        res = await client.get(u, headers={"User-Agent": "ExoPlayerLib/2.18.7"}, follow_redirects=True)
-        return Response(content=res.content, media_type="text/vtt", headers={"Access-Control-Allow-Origin": "*"})
+    """Proxies external subtitles to bypass CORS blocking with strict SSRF & TLS verification."""
+    if not is_safe_external_url(u):
+        raise HTTPException(status_code=400, detail="Invalid or prohibited subtitle URL")
+    try:
+        async with httpx.AsyncClient(verify=True, timeout=10.0) as client:
+            res = await client.get(u, headers={"User-Agent": "ExoPlayerLib/2.18.7"}, follow_redirects=True)
+            return Response(content=res.content, media_type="text/vtt", headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logger.error(f"Failed to fetch subtitle from {u}: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch subtitle")
 
 @app.post("/launch-player")
 def launch_player(
@@ -2135,19 +2289,17 @@ def launch_player(
     try:
         creation_flags = 0
         if os.name == 'nt':
-            creation_flags = 0x00000008 | 0x00000200
-        logger.info(f"Executing: {' '.join(cmd)}")
-        subprocess.Popen(cmd, creationflags=creation_flags, close_fds=True)
+            creation_flags = 0x00000200
+        logger.info(f"Executing secure player launch: {cmd}")
+        subprocess.Popen(cmd, creationflags=creation_flags, close_fds=True if os.name != 'nt' else False)
         return {"status": "success", "message": f"Launched {player}"}
     except Exception as e:
         logger.error(f"Failed to launch player: {e}")
-        try:
-            subprocess.Popen(cmd, shell=True)
-            return {"status": "success", "message": f"Launched {player} (fallback shell)"}
-        except Exception as e2:
-            logger.error(f"Fallback launch failed: {e2}")
-            raise HTTPException(status_code=500, detail=f"Could not launch {player}: {str(e2)}")
+        raise HTTPException(status_code=500, detail=f"Could not launch {player}: {str(e)}")
 
 if __name__ == "__main__":
-    # DISABLE RELOAD: Prevents Windows-specific crash loops during active streaming/editing
-    uvicorn.run("moviebox_api_server:app", host="0.0.0.0", port=8000, reload=False)
+    # BIND TO LOCALHOST BY DEFAULT: Mitigate LAN exposure (can override via HOST env var)
+    bind_host = os.getenv("API_HOST", "127.0.0.1")
+    bind_port = int(os.getenv("API_PORT", "8000"))
+    logger.info(f"Starting MovieBox API server on {bind_host}:{bind_port}")
+    uvicorn.run("moviebox_api_server:app", host=bind_host, port=bind_port, reload=False)
